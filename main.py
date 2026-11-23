@@ -4,16 +4,16 @@ import time
 import random
 import string
 import asyncio
-from pyrogram import Client, filters
+import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
-API_ID = int(os.environ.get("API_ID"))
-API_HASH = os.environ.get("API_HASH")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHANNEL_ID = int(os.environ.get("CHANNEL_ID"))
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+CHANNEL_ID = os.environ.get("CHANNEL_ID", "").strip()
+TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+TG_FILE_API = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 
 DB_FILE = "dxhub_db.json"
 os.makedirs("thumbs", exist_ok=True)
@@ -29,8 +29,6 @@ def save_db(data):
         json.dump(data, f, indent=2)
 
 db = load_db()
-
-bot = Client("dxhub_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 app = FastAPI()
 
 app.add_middleware(
@@ -43,82 +41,116 @@ app.add_middleware(
 def gen_code(length=7):
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
-@bot.on_message(filters.command("start") & filters.private)
-async def start_cmd(client, message):
-    await message.reply_text(
-        "👋 **DX HUB Cloud Bot में स्वागत है!**\n\n"
-        "📤 **वीडियो अपलोड:** मुझे कोई भी वीडियो भेजें या फॉरवर्ड करें — मैं थंबनेल निकालकर **Watch Link** और **More Videos Link** दे दूँगा।\n\n"
-        "🔑 **VIP Key (₹299/mo):** `/genkey 30` भेजें।"
-    )
+async def send_msg(client, chat_id, text):
+    await client.post(f"{TG_API}/sendMessage", json={
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "Markdown"
+    })
 
-@bot.on_message(filters.command("genkey") & filters.private)
-async def gen_vip_key(client, message):
-    try:
-        days = int(message.text.split()[1]) if len(message.text.split()) > 1 else 30
-    except:
-        days = 30
-    key = f"DXVIP-{random.randint(1000,9999)}-{gen_code(4).upper()}"
-    expiry = int(time.time()) + (days * 86400)
-    db["vip_keys"][key] = {"expiry": expiry, "days": days}
-    save_db(db)
-    await message.reply_text(
-        f"✅ **नई DX HUB VIP Key तैयार है!**\n\n"
-        f"🔑 **Key:** `{key}`\n"
-        f"⏳ **वैधता:** {days} दिन (100% Ad-Free)\n\n"
-        f"इसे यूज़र को भेज दें।"
-    )
+async def telegram_poller():
+    offset = 0
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        await client.get(f"{TG_API}/deleteWebhook")
+        while True:
+            try:
+                res = await client.get(f"{TG_API}/getUpdates", params={"offset": offset, "timeout": 20})
+                data = res.json()
+                if not data.get("ok"):
+                    await asyncio.sleep(3)
+                    continue
 
-@bot.on_message(filters.video & filters.private)
-async def handle_video(client, message):
-    status = await message.reply_text("⏳ **वीडियो प्रोसेस हो रहा है...**")
-    pub_id = str(message.from_user.id)
-    vid_code = f"{random.randint(10000,99999)}_{random.randint(1,9)}"
-    
-    sent = await message.copy(CHANNEL_ID, caption=f"ID: {vid_code} | Pub: {pub_id}")
-    
-    thumb_path = f"thumbs/{vid_code}.jpg"
-    if message.video.thumbs:
-        await client.download_media(message.video.thumbs[0].file_id, file_name=thumb_path)
-    
-    size_mb = round((message.video.file_size or 0) / (1024 * 1024), 1)
-    duration = message.video.duration or 0
-    
-    video_entry = {
-        "vid_id": vid_code,
-        "msg_id": sent.id,
-        "pub_id": pub_id,
-        "safe_name": f"{vid_code}_.mp4",
-        "size_mb": size_mb,
-        "duration": duration,
-        "has_thumb": os.path.exists(thumb_path),
-        "created_at": int(time.time())
-    }
-    db["videos"][vid_code] = video_entry
-    if pub_id not in db["publishers"]:
-        db["publishers"][pub_id] = []
-    db["publishers"][pub_id].insert(0, vid_code)
-    save_db(db)
-    
-    server_url = os.environ.get("RENDER_EXTERNAL_URL", "https://dxhub-server.onrender.com")
-    watch_url = f"{server_url}/watch/{vid_code}?unlock=DX1234"
-    channel_url = f"{server_url}/channel/{pub_id}?unlock=DX1234"
-    
-    caption_text = (
-        f"🎬 **नई वीडियो फाइल तैयार है!**\n"
-        f"📁 **File:** `{vid_code}_.mp4` ({size_mb} MB)\n\n"
-        f"▶️ **Watch & Download Link:**\n{watch_url}\n\n"
-        f"📂 **More Videos (चैनल की सभी वीडियो):**\n{channel_url}"
-    )
-    
-    await status.delete()
-    if os.path.exists(thumb_path):
-        await message.reply_photo(photo=thumb_path, caption=caption_text)
-    else:
-        await message.reply_text(caption_text)
+                for update in data.get("result", []):
+                    offset = update["update_id"] + 1
+                    msg = update.get("message")
+                    if not msg:
+                        continue
+
+                    chat_id = msg["chat"]["id"]
+                    text = msg.get("text", "")
+
+                    if text.startswith("/start"):
+                        await send_msg(client, chat_id,
+                            "👋 **DX HUB Official Bot चालू हो गया है!**\n\n"
+                            "📤 **वीडियो अपलोड:** मुझे कोई भी वीडियो भेजें या फॉरवर्ड करें — मैं तुरंत **Watch Link** और **More Videos Link** दे दूँगा।\n\n"
+                            "🔑 **VIP Key (₹299/mo):** `/genkey 30` भेजें।"
+                        )
+
+                    elif text.startswith("/genkey"):
+                        parts = text.split()
+                        days = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 30
+                        key = f"DXVIP-{random.randint(1000,9999)}-{gen_code(4).upper()}"
+                        expiry = int(time.time()) + (days * 86400)
+                        db["vip_keys"][key] = {"expiry": expiry, "days": days}
+                        save_db(db)
+                        await send_msg(client, chat_id,
+                            f"✅ **नई DX HUB VIP Key तैयार है!**\n\n"
+                            f"🔑 **Key:** `{key}`\n"
+                            f"⏳ **वैधता:** {days} दिन (100% Ad-Free)"
+                        )
+
+                    elif "video" in msg:
+                        video = msg["video"]
+                        file_id = video["file_id"]
+                        pub_id = str(chat_id)
+                        vid_code = f"{random.randint(10000,99999)}_{random.randint(1,9)}"
+                        size_mb = round((video.get("file_size", 0)) / (1024 * 1024), 1)
+                        duration = video.get("duration", 0)
+
+                        if CHANNEL_ID:
+                            await client.post(f"{TG_API}/copyMessage", json={
+                                "chat_id": CHANNEL_ID,
+                                "from_chat_id": chat_id,
+                                "message_id": msg["message_id"],
+                                "caption": f"ID: {vid_code}"
+                            })
+
+                        thumb_path = f"thumbs/{vid_code}.jpg"
+                        thumb_obj = video.get("thumbnail") or video.get("thumb")
+                        if thumb_obj:
+                            f_info = (await client.get(f"{TG_API}/getFile", params={"file_id": thumb_obj["file_id"]})).json()
+                            if f_info.get("ok"):
+                                f_path = f_info["result"]["file_path"]
+                                img_data = await client.get(f"{TG_FILE_API}/{f_path}")
+                                with open(thumb_path, "wb") as tf:
+                                    tf.write(img_data.content)
+
+                        db["videos"][vid_code] = {
+                            "vid_id": vid_code,
+                            "file_id": file_id,
+                            "pub_id": pub_id,
+                            "safe_name": f"{vid_code}_.mp4",
+                            "size_mb": size_mb,
+                            "duration": duration,
+                            "has_thumb": os.path.exists(thumb_path),
+                            "created_at": int(time.time())
+                        }
+                        if pub_id not in db["publishers"]:
+                            db["publishers"][pub_id] = []
+                        db["publishers"][pub_id].insert(0, vid_code)
+                        save_db(db)
+
+                        server_url = os.environ.get("RENDER_EXTERNAL_URL", "https://dxhub-server.onrender.com").rstrip("/")
+                        watch_url = f"{server_url}/watch/{vid_code}?unlock=DX1234"
+                        channel_url = f"{server_url}/channel/{pub_id}?unlock=DX1234"
+
+                        await send_msg(client, chat_id,
+                            f"🎬 **नई वीडियो फाइल तैयार है!**\n"
+                            f"📁 **File:** `{vid_code}_.mp4` ({size_mb} MB)\n\n"
+                            f"▶️ **Watch & Download Link:**\n{watch_url}\n\n"
+                            f"📂 **More Videos Link:**\n{channel_url}"
+                        )
+            except Exception as e:
+                print("Polling error:", e)
+                await asyncio.sleep(3)
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(telegram_poller())
 
 @app.get("/")
 async def home():
-    return {"status": "DX HUB Server Running", "total_videos": len(db["videos"])}
+    return {"status": "DX HUB Bot & Server Live", "total_videos": len(db["videos"])}
 
 @app.get("/api/video/{vid_id}")
 async def get_video_info(vid_id: str):
@@ -153,29 +185,23 @@ async def verify_vip(key: str):
 async def stream_video(vid_id: str, request: Request):
     if vid_id not in db["videos"]:
         raise HTTPException(status_code=404, detail="Video not found")
-    msg_id = db["videos"][vid_id]["msg_id"]
-    msg = await bot.get_messages(CHANNEL_ID, msg_id)
-    file_size = msg.video.file_size
-    
-    range_header = request.headers.get("range")
-    start = 0
-    end = file_size - 1
-    if range_header:
-        parts = range_header.replace("bytes=", "").split("-")
-        start = int(parts[0]) if parts[0] else 0
-        end = int(parts[1]) if len(parts) > 1 and parts[1] else file_size - 1
-        
-    async def file_generator():
-        async for chunk in bot.stream_media(msg, offset=start // (1024 * 1024)):
-            yield chunk
+    file_id = db["videos"][vid_id]["file_id"]
+    async with httpx.AsyncClient() as client:
+        f_info = (await client.get(f"{TG_API}/getFile", params={"file_id": file_id})).json()
+        if not f_info.get("ok"):
+            raise HTTPException(status_code=400, detail="File too large or invalid")
+        file_url = f"{TG_FILE_API}/{f_info['result']['file_path']}"
 
-    headers = {
-        "Content-Range": f"bytes {start}-{end}/{file_size}",
-        "Accept-Ranges": "bytes",
-        "Content-Length": str(end - start + 1),
-        "Content-Type": "video/mp4",
-    }
-    return StreamingResponse(file_generator(), status_code=206 if range_header else 200, headers=headers)
+    range_header = request.headers.get("range")
+    req_headers = {"Range": range_header} if range_header else {}
+
+    async def stream_gen():
+        async with httpx.AsyncClient(timeout=None) as s_client:
+            async with s_client.stream("GET", file_url, headers=req_headers) as r:
+                async for chunk in r.aiter_bytes(chunk_size=512 * 1024):
+                    yield chunk
+
+    return StreamingResponse(stream_gen(), media_type="video/mp4")
 
 @app.get("/watch/{vid_id}")
 async def deep_link_redirect(vid_id: str, unlock: str = ""):
@@ -191,12 +217,6 @@ async def deep_link_redirect(vid_id: str, unlock: str = ""):
     """
     return HTMLResponse(content=html)
 
-async def start_services():
-    await bot.start()
-    port = int(os.environ.get("PORT", 10000))
-    config = uvicorn.Config(app, host="0.0.0.0", port=port)
-    server = uvicorn.Server(config)
-    await server.serve()
-
 if __name__ == "__main__":
-    asyncio.run(start_services())
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
